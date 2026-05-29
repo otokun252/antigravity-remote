@@ -11,6 +11,9 @@ const HOST = process.env.ANTIGRAVITY_REMOTE_HOST || '0.0.0.0';
 const STATE_PATH = path.join(ROOT, 'antigravity_bridge.json');
 const CONNECTION_PATH = path.join(ROOT, 'connection.txt');
 const DIST_PATH = path.join(ROOT, 'dist');
+const MEDIA_ROOT = path.join(ROOT, 'output', 'media');
+const CAPTURE_ROOT = path.join(MEDIA_ROOT, 'captures');
+const UPLOAD_ROOT = path.join(MEDIA_ROOT, 'uploads');
 const DEFAULT_WORKSPACE = process.env.TARGET_WORKSPACE_PATH
   ? path.resolve(ROOT, process.env.TARGET_WORKSPACE_PATH)
   : ROOT;
@@ -41,6 +44,29 @@ const EXCLUDED_NAMES = new Set([
   'antigravity_bridge.json',
   'connection.txt',
 ]);
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
+const TEXT_EXTENSIONS = new Set([
+  '.md',
+  '.txt',
+  '.json',
+  '.js',
+  '.jsx',
+  '.ts',
+  '.tsx',
+  '.css',
+  '.html',
+  '.yml',
+  '.yaml',
+  '.xml',
+  '.cjs',
+  '.mjs',
+  '.py',
+  '.ps1',
+  '.toml',
+  '.ini',
+  '.env',
+]);
 const TOKEN =
   process.env.ANTIGRAVITY_REMOTE_TOKEN ||
   process.env.ACCESS_TOKEN ||
@@ -68,6 +94,7 @@ function loadState() {
   }
   return {
     tasks: [],
+    automationDrafts: [],
     workspacePath: DEFAULT_WORKSPACE,
     model: 'Auto',
     customModel: '',
@@ -79,10 +106,52 @@ function saveState(state) {
   const cleanState = {
     ...state,
     tasks: (state.tasks || []).slice(0, 80),
+    automationDrafts: (state.automationDrafts || []).slice(0, 40),
     updatedAt: new Date().toISOString(),
   };
   fs.writeFileSync(STATE_PATH, JSON.stringify(cleanState, null, 2), 'utf8');
   return cleanState;
+}
+
+function ensureDir(target) {
+  fs.mkdirSync(target, { recursive: true });
+}
+
+ensureDir(MEDIA_ROOT);
+ensureDir(CAPTURE_ROOT);
+ensureDir(UPLOAD_ROOT);
+
+function isImageFile(targetPath) {
+  return IMAGE_EXTENSIONS.has(path.extname(String(targetPath || '')).toLowerCase());
+}
+
+function isVideoFile(targetPath) {
+  return VIDEO_EXTENSIONS.has(path.extname(String(targetPath || '')).toLowerCase());
+}
+
+function isTextFile(targetPath) {
+  return TEXT_EXTENSIONS.has(path.extname(String(targetPath || '')).toLowerCase());
+}
+
+function safeFileName(value) {
+  return String(value || 'file')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+    .replace(/\s+/g, '-')
+    .slice(0, 120);
+}
+
+function mediaUrlForAbsolute(absolutePath) {
+  const relative = path.relative(MEDIA_ROOT, absolutePath).replace(/\\/g, '/');
+  return `/media/${relative}`;
+}
+
+function getDesktopRoots() {
+  const home = os.homedir();
+  return [
+    path.join(home, 'Desktop'),
+    path.join(home, 'OneDrive', 'Desktop'),
+    path.join(home, 'OneDrive', 'デスクトップ'),
+  ].filter((value, index, list) => value && list.indexOf(value) === index);
 }
 
 function getWorkspacePath(state = loadState()) {
@@ -165,11 +234,9 @@ function resolveWorkspacePathForProject(projectName, state = loadState()) {
   }
 
   const currentWorkspace = getWorkspacePath(state);
-  const siblingRoot = path.dirname(currentWorkspace);
-  const desktopRoot = path.join(os.homedir(), 'OneDrive', 'デスクトップ');
   const candidates = [
-    path.join(siblingRoot, name),
-    path.join(desktopRoot, name),
+    path.join(path.dirname(currentWorkspace), name),
+    ...getDesktopRoots().map((root) => path.join(root, name)),
   ];
 
   for (const candidate of candidates) {
@@ -258,26 +325,51 @@ function getLocalUrls() {
 }
 
 function getAntigravityStatus() {
-  const command = [
-    '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ',
-    '$OutputEncoding = [Console]::OutputEncoding; ',
-    'Get-Process Antigravity -ErrorAction SilentlyContinue | ',
-    'Select-Object Id,ProcessName,MainWindowTitle,Path | ConvertTo-Json -Compress',
-  ].join('');
+  if (process.platform === 'win32') {
+    const command = [
+      '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ',
+      '$OutputEncoding = [Console]::OutputEncoding; ',
+      'Get-Process Antigravity -ErrorAction SilentlyContinue | ',
+      'Select-Object Id,ProcessName,MainWindowTitle,Path | ConvertTo-Json -Compress',
+    ].join('');
+    try {
+      const output = require('child_process')
+        .execFileSync('powershell.exe', ['-NoProfile', '-Command', command], {
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 4000,
+        })
+        .trim();
+      if (!output) return { running: false, processes: [], platform: process.platform };
+      const parsed = JSON.parse(output);
+      const processes = Array.isArray(parsed) ? parsed : [parsed];
+      return { running: processes.length > 0, processes, platform: process.platform };
+    } catch {
+      return { running: false, processes: [], platform: process.platform };
+    }
+  }
+
   try {
     const output = require('child_process')
-      .execFileSync('powershell.exe', ['-NoProfile', '-Command', command], {
+      .execFileSync('bash', ['-lc', "pgrep -fal 'Antigravity' || true"], {
         encoding: 'utf8',
-        windowsHide: true,
         timeout: 4000,
       })
       .trim();
-    if (!output) return { running: false, processes: [] };
-    const parsed = JSON.parse(output);
-    const processes = Array.isArray(parsed) ? parsed : [parsed];
-    return { running: processes.length > 0, processes };
+    const processes = output
+      ? output.split(/\r?\n/).map((line) => {
+          const firstSpace = line.indexOf(' ');
+          return {
+            Id: firstSpace > 0 ? Number(line.slice(0, firstSpace)) : null,
+            ProcessName: 'Antigravity',
+            MainWindowTitle: line.slice(firstSpace + 1),
+            Path: '',
+          };
+        })
+      : [];
+    return { running: processes.length > 0, processes, platform: process.platform };
   } catch {
-    return { running: false, processes: [] };
+    return { running: false, processes: [], platform: process.platform };
   }
 }
 
@@ -291,11 +383,14 @@ function requireToken(req, res, next) {
 
 function copyToClipboard(text) {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-Command', 'Set-Clipboard -Value $input'],
-      { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true },
-    );
+    const command =
+      process.platform === 'darwin'
+        ? ['pbcopy', []]
+        : ['powershell.exe', ['-NoProfile', '-Command', 'Set-Clipboard -Value $input']];
+    const child = spawn(command[0], command[1], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+      windowsHide: true,
+    });
     let errorText = '';
     child.stderr.on('data', (chunk) => {
       errorText += chunk.toString();
@@ -310,6 +405,15 @@ function copyToClipboard(text) {
 }
 
 function openAntigravity() {
+  if (process.platform === 'darwin') {
+    return new Promise((resolve, reject) => {
+      execFile('open', ['-a', 'Antigravity'], (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
   const defaultPath = path.join(
     os.homedir(),
     'AppData',
@@ -380,8 +484,14 @@ Start-Sleep -Milliseconds 500
 }
 
 async function withCdp(callback) {
-  const portFile = path.join(os.homedir(), 'AppData', 'Roaming', 'Antigravity', 'DevToolsActivePort');
-  if (!fs.existsSync(portFile)) {
+  const portFileCandidates = process.platform === 'darwin'
+    ? [
+        path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort'),
+        path.join(os.homedir(), 'Library', 'Application Support', 'antigravity', 'DevToolsActivePort'),
+      ]
+    : [path.join(os.homedir(), 'AppData', 'Roaming', 'Antigravity', 'DevToolsActivePort')];
+  const portFile = portFileCandidates.find((candidate) => fs.existsSync(candidate));
+  if (!portFile) {
     throw new Error('Antigravity DevToolsActivePort was not found.');
   }
 
@@ -520,21 +630,74 @@ async function antigravityState() {
             /usage|remaining|limit|quota/i.test(text)
           ) ||
         '';
-      const pendingActions = Array.from(document.querySelectorAll('button,[role="button"]'))
-        .map((el) => {
-          const label = (el.innerText || el.getAttribute('aria-label') || '').trim();
-          if (!label || label.length > 40) return null;
-          if (!/^(approve|reject|allow|deny|yes|no|continue|cancel)$/i.test(label)) return null;
-          const disabled =
-            el.hasAttribute('disabled') ||
-            el.getAttribute('aria-disabled') === 'true';
+      const approvalPrompt = (() => {
+        const candidates = Array.from(document.querySelectorAll('div,[role="dialog"],section'))
+          .filter((el) => {
+            const text = (el.innerText || '').trim();
+            if (!text || text.length > 1400) return false;
+            if (!el.querySelector('button,[role="button"]')) return false;
+            return /allow .*access|permission|waiting for user input|always allow|allow this time|yes,|^1\s+yes|^2\s+yes|^3\s+yes|^4\s+no/m.test(text);
+          })
+          .sort((a, b) => (b.innerText || '').length - (a.innerText || '').length);
+
+        for (const card of candidates) {
+          const actions = Array.from(card.querySelectorAll('button,[role="button"]'))
+            .map((el, index) => {
+            const label = (el.innerText || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
+            if (!label) return null;
+            const lower = label.toLowerCase();
+            if (!/^(submit|skip|yes\b|no\b|allow\b|deny\b|reject\b|cancel\b)/i.test(lower)) return null;
+            const disabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+            const kind = lower.startsWith('submit')
+              ? 'submit'
+              : lower.startsWith('skip')
+                ? 'skip'
+                : 'option';
+            return {
+              label,
+              actionKey: kind === 'option' ? 'approval-option:' + index : kind,
+              disabled,
+              kind,
+            };
+          })
+          .filter(Boolean);
+
+          if (!actions.length) continue;
+
           return {
-            label,
-            actionKey: label.toLowerCase(),
-            disabled
+            title: ((card.querySelector('strong,h1,h2,h3')?.innerText || '').trim()) || 'Approval required',
+            body: (card.innerText || '').trim(),
+            actions,
           };
-        })
-        .filter(Boolean);
+        }
+
+        return null;
+      })();
+
+      const waitingForInput = /waiting for user input/i.test(document.body.innerText || '') ||
+        threadBlocks.some((item) => /waiting for user input/i.test(item.text));
+
+      const pendingActions = approvalPrompt
+        ? approvalPrompt.actions
+        : waitingForInput
+          ? []
+          : Array.from(document.querySelectorAll('button,[role="button"]'))
+          .map((el) => {
+            const label = (el.innerText || el.getAttribute('aria-label') || '').trim();
+            if (!label || label.length > 40) return null;
+            const match = label.toLowerCase().match(/^(approve|reject|allow|deny|yes|no|continue|cancel)\b/);
+            if (!match) return null;
+              const disabled =
+                el.hasAttribute('disabled') ||
+                el.getAttribute('aria-disabled') === 'true';
+              return {
+                label,
+                actionKey: match[1],
+                disabled,
+                kind: 'simple',
+              };
+            })
+            .filter(Boolean);
 
       return {
         url: location.href,
@@ -550,18 +713,69 @@ async function antigravityState() {
         projectSections,
         conversations: conversationItems,
         threadBlocks,
+        approvalPrompt,
         pendingActions,
         draft: editor ? editor.innerText : '',
         canSend: send ? send.getAttribute('aria-label') === 'Send message' : false,
+        canStop: send ? send.getAttribute('aria-label') !== 'Send message' : false,
         sendLabel: send ? send.getAttribute('aria-label') : null
       };
     })()`;
 
     const result = await call('Runtime.evaluate', { expression, returnByValue: true });
+    const value = result.result.value || {};
+    const filteredPendingActions = Array.isArray(value.pendingActions)
+      ? value.pendingActions.filter((action) =>
+          /^(submit|skip|yes\b|no\b|allow\b|deny\b|reject\b|cancel\b)/i.test(String(action?.label || '').trim()),
+        )
+      : [];
+    const filteredApprovalPrompt =
+      value.approvalPrompt && filteredPendingActions.length
+        ? { ...value.approvalPrompt, actions: filteredPendingActions }
+        : null;
     return {
       pageUrl: target.url,
-      ...result.result.value,
-    };
+      ...value,
+        approvalPrompt: filteredApprovalPrompt,
+        pendingActions: filteredPendingActions,
+      };
+  });
+}
+
+async function stopAntigravityRun() {
+  return withCdp(async ({ call }) => {
+    const result = await call('Runtime.evaluate', {
+      expression: `(() => {
+        const buttons = Array.from(document.querySelectorAll('button,[role="button"]'));
+        const sendButton = document.querySelector('[data-testid="send-button"]');
+        const isEnabled = (node) => node && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true';
+        const labelOf = (node) => ((node?.innerText || node?.getAttribute('aria-label') || '').trim());
+
+        const sendLabel = labelOf(sendButton);
+        if (sendButton && isEnabled(sendButton) && sendLabel && !/^send message$/i.test(sendLabel)) {
+          sendButton.click();
+          return { ok: true, label: sendLabel };
+        }
+
+        const stopButton = buttons.find((node) => {
+          if (!isEnabled(node)) return false;
+          const label = labelOf(node);
+          return /^(stop|cancel)(\\b|\\s)|stop generating|cancel generation|interrupt/i.test(label);
+        });
+        if (stopButton) {
+          stopButton.click();
+          return { ok: true, label: labelOf(stopButton) };
+        }
+
+        return { ok: false, reason: 'stop button not found' };
+      })()`,
+      returnByValue: true,
+    });
+    const value = result.result.value;
+    if (!value?.ok) {
+      throw new Error(value?.reason || 'Stop action failed.');
+    }
+    return antigravityState();
   });
 }
 
@@ -671,13 +885,49 @@ async function performPendingAction(actionKey) {
     const result = await call('Runtime.evaluate', {
       expression: `(() => {
         const wanted = ${JSON.stringify(String(actionKey || '').toLowerCase())};
-        const buttons = Array.from(document.querySelectorAll('button,[role="button"]'));
-        const target = buttons.find((el) => {
-          const label = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
-          const disabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
-          return !disabled && label === wanted;
-        });
+        const pageText = document.body.innerText || '';
+        const inApprovalMode = /waiting for user input/i.test(pageText);
+        let target = null;
+
+        if (inApprovalMode) {
+          const cards = Array.from(document.querySelectorAll('div,[role="dialog"],section'))
+            .filter((el) => {
+              const text = (el.innerText || '').trim();
+              return text && text.length <= 1400 &&
+                /allow .*access|permission|submit|skip|waiting for user input/i.test(text) &&
+                el.querySelector('button,[role="button"]');
+            })
+            .sort((a, b) => (b.innerText || '').length - (a.innerText || '').length);
+          const card = cards[0];
+          const buttons = card ? Array.from(card.querySelectorAll('button,[role="button"]')) : [];
+
+          if (wanted.startsWith('approval-option:')) {
+            const index = Number(wanted.split(':')[1]);
+            target = Number.isFinite(index) ? buttons[index] : null;
+          } else if (wanted === 'submit' || wanted === 'skip') {
+            target = buttons.find((el) => ((el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase().startsWith(wanted)));
+          }
+        }
+
+        if (!target) {
+          const buttons = Array.from(document.querySelectorAll('button,[role="button"]'));
+          target = buttons.find((el) => {
+            const label = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+            const disabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+            if (disabled) return false;
+
+            if (wanted === 'yes' || wanted === 'allow') {
+              return label.startsWith('yes, allow') || label.includes('allow this time') || label === 'yes' || label === 'allow';
+            }
+            if (wanted === 'no' || wanted === 'deny') {
+              return label.startsWith('no (') || label.includes('do instead') || label === 'no' || label === 'deny';
+            }
+            return label === wanted || label.startsWith(wanted);
+          });
+        }
         if (!target) return { ok: false, reason: 'pending action not found' };
+        const disabled = target.hasAttribute('disabled') || target.getAttribute('aria-disabled') === 'true';
+        if (disabled) return { ok: false, reason: 'pending action is disabled' };
         target.click();
         return { ok: true };
       })()`,
@@ -754,8 +1004,182 @@ function writeConnectionFile(extra = {}) {
   return urls;
 }
 
+function inferImageMime(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.svg') return 'image/svg+xml';
+  if (ext === '.bmp') return 'image/bmp';
+  return 'application/octet-stream';
+}
+
+function inferVideoMime(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.m4v') return 'video/x-m4v';
+  if (ext === '.ogv') return 'video/ogg';
+  return 'video/mp4';
+}
+
+function findRecentMediaFiles(rootPath, maxCount = 10, depth = 3, prefix = '') {
+  const found = [];
+  const walk = (currentPath, currentDepth, relativePrefix) => {
+    if (found.length >= maxCount * 3) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || EXCLUDED_NAMES.has(entry.name)) continue;
+      const absolutePath = path.join(currentPath, entry.name);
+      const relativePath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (currentDepth < depth) {
+          walk(absolutePath, currentDepth + 1, relativePath);
+        }
+        continue;
+      }
+      if (!isImageFile(absolutePath) && !isVideoFile(absolutePath)) continue;
+      try {
+        const stats = fs.statSync(absolutePath);
+        found.push({
+          name: entry.name,
+          path: relativePath.replace(/\\/g, '/'),
+          size: stats.size,
+          modifiedAt: stats.mtime.toISOString(),
+          kind: isVideoFile(absolutePath) ? 'video' : 'image',
+          source: prefix || 'workspace',
+        });
+      } catch {
+        // Ignore unreadable file.
+      }
+    }
+  };
+  if (fs.existsSync(rootPath)) {
+    walk(rootPath, 0, '');
+  }
+  return found
+    .sort((a, b) => String(b.modifiedAt).localeCompare(String(a.modifiedAt)))
+    .slice(0, maxCount);
+}
+
+function getRecentMedia(state = loadState()) {
+  const workspace = getWorkspacePath(state);
+  const uploaded = findRecentMediaFiles(UPLOAD_ROOT, 8, 2, '');
+  const captures = findRecentMediaFiles(CAPTURE_ROOT, 8, 2, '');
+  const workspaceImages = findRecentMediaFiles(workspace, 12, 3, '');
+  return {
+    uploads: uploaded.map((item) => ({ ...item, url: mediaUrlForAbsolute(path.join(UPLOAD_ROOT, item.path)) })),
+    captures: captures.map((item) => ({ ...item, url: mediaUrlForAbsolute(path.join(CAPTURE_ROOT, item.path)) })),
+    workspaceImages: workspaceImages.map((item) => ({
+      ...item,
+      url: `/api/file-asset?path=${encodeURIComponent(item.path)}&token=${TOKEN}`,
+    })),
+  };
+}
+
+function saveDataUrlMedia(dataUrl, nameHint, destinationRoot) {
+  const match = String(dataUrl || '').match(/^data:((?:image|video)\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) {
+    throw new Error('Media data is invalid.');
+  }
+  const mime = match[1].toLowerCase();
+  const ext =
+    mime === 'image/png' ? '.png'
+    : mime === 'image/jpeg' ? '.jpg'
+    : mime === 'image/webp' ? '.webp'
+    : mime === 'image/gif' ? '.gif'
+    : mime === 'video/mp4' ? '.mp4'
+    : mime === 'video/webm' ? '.webm'
+    : mime === 'video/quicktime' ? '.mov'
+    : mime === 'video/x-m4v' ? '.m4v'
+    : mime === 'video/ogg' ? '.ogv'
+    : '.png';
+  const fallbackName = mime.startsWith('video/') ? 'video' : 'image';
+  const baseName = safeFileName(path.basename(String(nameHint || fallbackName), path.extname(String(nameHint || fallbackName))));
+  const fileName = `${Date.now()}-${baseName || fallbackName}${ext}`;
+  ensureDir(destinationRoot);
+  const absolutePath = path.join(destinationRoot, fileName);
+  fs.writeFileSync(absolutePath, Buffer.from(match[2], 'base64'));
+  return absolutePath;
+}
+
+function parseAutomationInstruction(instruction) {
+  const text = String(instruction || '').trim();
+  if (!text) {
+    throw new Error('Automation instruction is required.');
+  }
+
+  const hourMatch = text.match(/(?:毎日|daily).{0,8}?(\d{1,2})(?::|時)(\d{1,2})?/i);
+  const minute = hourMatch?.[2] ? Number(hourMatch[2]) : 0;
+  const hour = hourMatch?.[1] ? Number(hourMatch[1]) : null;
+  let rrule = 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0';
+  if (hour !== null && Number.isFinite(hour)) {
+    rrule = `FREQ=DAILY;BYHOUR=${hour};BYMINUTE=${minute};BYSECOND=0`;
+  } else if (/毎週|weekly/i.test(text)) {
+    rrule = 'FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=0;BYSECOND=0';
+  } else if (/毎時|hourly/i.test(text)) {
+    rrule = 'FREQ=HOURLY;INTERVAL=1';
+  }
+
+  const title = text
+    .replace(/^\/?automation\s*/i, '')
+    .replace(/毎日.*$/u, '')
+    .trim()
+    .slice(0, 80) || 'Automation task';
+
+  return {
+    title,
+    instruction: text,
+    rrule,
+    commandText: `/automation ${title}\nSchedule: ${rrule}\nTask: ${text}`,
+  };
+}
+
+async function captureDesktopScreenshot() {
+  ensureDir(CAPTURE_ROOT);
+  const absolutePath = path.join(CAPTURE_ROOT, `${Date.now()}-desktop.png`);
+  if (process.platform === 'darwin') {
+    await new Promise((resolve, reject) => {
+      execFile('screencapture', ['-x', absolutePath], (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  } else {
+    const script = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bitmap.Size)
+$bitmap.Save('${absolutePath.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png)
+$graphics.Dispose()
+$bitmap.Dispose()
+`;
+    await new Promise((resolve, reject) => {
+      execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: true }, (error, _stdout, stderr) => {
+        if (error) reject(new Error(stderr || error.message));
+        else resolve();
+      });
+    });
+  }
+  return {
+    path: absolutePath,
+    url: mediaUrlForAbsolute(absolutePath),
+    name: path.basename(absolutePath),
+  };
+}
+
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '15mb' }));
+app.use('/media', express.static(MEDIA_ROOT));
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
@@ -772,11 +1196,14 @@ app.get('/api/status', (_req, res) => {
     port: PORT,
     urls,
     antigravity: getAntigravityStatus(),
+    platform: process.platform,
     taskCount: state.tasks.length,
+    automationCount: (state.automationDrafts || []).length,
     workspacePath,
     model: state.model || 'Auto',
     customModel: state.customModel || '',
     models: DEFAULT_MODELS,
+    recentMedia: getRecentMedia(state),
     updatedAt: state.updatedAt || null,
   });
 });
@@ -855,12 +1282,101 @@ app.get('/api/file', (req, res) => {
     const { resolved } = safeResolveInWorkspace(requestedPath, state);
     const stats = fs.statSync(resolved);
     if (!stats.isFile()) return res.status(400).json({ error: 'Path is not a file.' });
+    if (isImageFile(resolved)) {
+      return res.json({
+        path: requestedPath,
+        kind: 'image',
+        size: stats.size,
+        assetUrl: `/api/file-asset?path=${encodeURIComponent(requestedPath)}&token=${TOKEN}`,
+      });
+    }
+    if (isVideoFile(resolved)) {
+      return res.json({
+        path: requestedPath,
+        kind: 'video',
+        size: stats.size,
+        assetUrl: `/api/file-asset?path=${encodeURIComponent(requestedPath)}&token=${TOKEN}`,
+      });
+    }
+    if (!isTextFile(resolved)) {
+      return res.json({
+        path: requestedPath,
+        kind: 'binary',
+        size: stats.size,
+      });
+    }
     if (stats.size > 300000) return res.status(400).json({ error: 'File is too large to preview.' });
     const content = fs.readFileSync(resolved, 'utf8');
-    res.json({ path: requestedPath, content, size: stats.size });
+    res.json({ path: requestedPath, kind: 'text', content, size: stats.size });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
+});
+
+app.get('/api/file-asset', (req, res) => {
+  try {
+    const requestedPath = String(req.query.path || '');
+    if (!requestedPath) return res.status(400).json({ error: 'File path is required.' });
+    const state = loadState();
+    const { resolved } = safeResolveInWorkspace(requestedPath, state);
+    const stats = fs.statSync(resolved);
+    if (!stats.isFile() || (!isImageFile(resolved) && !isVideoFile(resolved))) {
+      return res.status(400).json({ error: 'Media file was not found.' });
+    }
+    res.setHeader('Content-Type', isVideoFile(resolved) ? inferVideoMime(resolved) : inferImageMime(resolved));
+    fs.createReadStream(resolved).pipe(res);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+function handleMediaUpload(req, res) {
+  try {
+    const dataUrl = String(req.body?.dataUrl || '');
+    const name = String(req.body?.name || 'media');
+    if (!dataUrl) return res.status(400).json({ error: 'Media data is required.' });
+    const workspace = getWorkspacePath();
+    const workspaceUploadRoot = path.join(workspace, 'Antigravity Remote Uploads');
+    ensureDir(workspaceUploadRoot);
+    const absolutePath = saveDataUrlMedia(dataUrl, name, workspaceUploadRoot);
+    const relativePath = toRelative(workspace, absolutePath);
+    const publicCopy = path.join(UPLOAD_ROOT, path.basename(absolutePath));
+    fs.copyFileSync(absolutePath, publicCopy);
+    const kind = isVideoFile(absolutePath) ? 'video' : 'image';
+    res.json({
+      ok: true,
+      file: {
+        name: path.basename(absolutePath),
+        path: relativePath,
+        absolutePath,
+        kind,
+        assetUrl: `/api/file-asset?path=${encodeURIComponent(relativePath)}&token=${TOKEN}`,
+        mirrorUrl: mediaUrlForAbsolute(publicCopy),
+      },
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+}
+
+app.post('/api/upload-media', handleMediaUpload);
+
+app.post('/api/upload-image', (req, res) => {
+  handleMediaUpload(req, res);
+});
+
+app.post('/api/screenshot', async (_req, res) => {
+  try {
+    const capture = await captureDesktopScreenshot();
+    res.json({ ok: true, capture });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/media/recent', (_req, res) => {
+  const state = loadState();
+  res.json({ ok: true, recentMedia: getRecentMedia(state) });
 });
 
 app.post('/api/model', (req, res) => {
@@ -883,6 +1399,11 @@ app.post('/api/antigravity/send', async (req, res) => {
   if (!text) return res.status(400).json({ error: 'Text is required.' });
   const send = req.body?.send !== false;
   const state = await sendPromptToAntigravity(text, { send });
+  res.json({ ok: true, state });
+});
+
+app.post('/api/antigravity/stop', async (_req, res) => {
+  const state = await stopAntigravityRun();
   res.json({ ok: true, state });
 });
 
@@ -942,6 +1463,43 @@ app.post('/api/antigravity/pending-action', async (req, res) => {
   await new Promise((resolve) => setTimeout(resolve, 250));
   const state = await antigravityState();
   res.json({ ok: true, state });
+});
+
+app.get('/api/automation', (_req, res) => {
+  const state = loadState();
+  res.json({ ok: true, drafts: state.automationDrafts || [] });
+});
+
+app.post('/api/automation/parse', (req, res) => {
+  try {
+    const draft = parseAutomationInstruction(req.body?.instruction);
+    res.json({ ok: true, draft });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/automation/create', async (req, res) => {
+  try {
+    const draft = parseAutomationInstruction(req.body?.instruction);
+    const state = loadState();
+    const record = {
+      id: `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`,
+      ...draft,
+      createdAt: new Date().toISOString(),
+    };
+    state.automationDrafts = [record, ...(state.automationDrafts || [])];
+    saveState(state);
+
+    let agState = null;
+    if (req.body?.sendToAntigravity !== false) {
+      agState = await sendPromptToAntigravity(record.commandText, { send: true });
+    }
+
+    res.json({ ok: true, draft: record, drafts: state.automationDrafts, state: agState });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.get('/api/tasks', (_req, res) => {

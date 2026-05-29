@@ -14,6 +14,7 @@ output/
 temp/
 tmp/
 test-results/
+Antigravity Remote Uploads/
 .obsidian/
 *.local
 
@@ -36,3 +37,7 @@ connection.txt
 *.njsproj
 *.sln
 *.sw?
+.local-bin/
+antigravity-qr-latest.png
+confirm_file.txt
+generate_ag_qr.cjs

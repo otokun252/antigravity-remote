@@ -1,45 +1,82 @@
 # Antigravity Remote
 
-Phone-friendly remote UI for controlling a local Antigravity desktop session.
+Mobile web bridge for a local Antigravity desktop session.
 
-This project gives you a mobile web bridge for:
+This repo is meant to be shared through GitHub and run on each user's own machine. The recommended architecture is:
 
-- viewing the current Antigravity conversation from your phone
-- sending prompts into Antigravity
-- switching Antigravity projects from the phone
-- browsing the current workspace files
-- copying file paths and file contents
-- using a LAN URL or a Cloudflare Tunnel URL
+- Antigravity desktop runs locally on the user's PC or Mac
+- this bridge server runs locally on the same machine
+- the phone opens the remote UI through a Cloudflare Tunnel URL
 
-This is a practical bridge, not an official Antigravity API client.
+This is not an official Antigravity API client. It is a local bridge that mirrors and controls a real Antigravity desktop session.
+
+## What it does
+
+- mirror the current Antigravity conversation on a phone
+- send prompts from a phone into Antigravity
+- stop a running response from the phone
+- switch projects and conversations
+- browse workspace files and copy paths or contents
+- upload images and videos into the workspace
+- trigger screenshots
+- handle approval prompts from the phone
 
 ## Requirements
 
-- Windows machine with Antigravity desktop installed
+- Antigravity desktop installed on Windows or macOS
 - Node.js 20+
 - npm
-- optional: `cloudflared` for outside access
+- `cloudflared` installed for the default outside-access flow
 
-## Quick Start
+## Quick start
 
-```bash
-npm install
+### Windows
+
+```powershell
+git clone https://github.com/otokun252/antigravity-remote.git
+cd antigravity-remote
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 npm run mobile
 ```
 
-After startup, open `connection.txt` and use the generated URL on your phone.
-
-For outside access:
+### macOS
 
 ```bash
-npm run mobile:tunnel
+git clone https://github.com/otokun252/antigravity-remote.git
+cd antigravity-remote
+chmod +x ./scripts/setup-macos.sh
+./scripts/setup-macos.sh
+npm run mobile
 ```
 
-If `cloudflared` is available, the tunnel URL is appended to `connection.txt`.
+`npm run mobile` starts the bridge in tunnel mode by default. After startup, open `connection.txt` and use the `URL:` value on your phone.
+
+Example:
+
+```txt
+MODE: tunnel
+URL: https://example.trycloudflare.com?token=...
+```
+
+## Local-only mode
+
+This repo now treats outside access as the default. If you explicitly want same-Wi-Fi testing only:
+
+```bash
+npm run mobile:local
+```
+
+## cloudflared
+
+The default startup expects `cloudflared` to be installed. If it is missing, `npm run mobile` fails instead of silently falling back to LAN mode.
+
+Cloudflare installation docs:
+
+- https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
 
 ## Environment
 
-Copy `.env.example` to `.env` if you want to override defaults.
+Copy `.env.example` to `.env` if you need overrides.
 
 Available settings:
 
@@ -48,28 +85,26 @@ Available settings:
 - `ANTIGRAVITY_REMOTE_HOST`
 - `TARGET_WORKSPACE_PATH`
 
-## Main Scripts
+## Scripts
 
 ```bash
 npm run dev
 npm run build
 npm run server
 npm run mobile
-npm run mobile:tunnel
+npm run mobile:local
 npm run lint
 ```
 
-## Typical Flow
+## Typical flow
 
-1. Start Antigravity on the PC.
-2. Run `npm run mobile` or `npm run mobile:tunnel`.
-3. Open the URL from `connection.txt` on the phone.
-4. Pick the target project or workspace.
-5. Send prompts from the mobile UI.
+1. Start Antigravity on the computer.
+2. Run `npm run mobile`.
+3. Wait for the tunnel URL to appear in `connection.txt`.
+4. Open that URL on the phone.
+5. Work from the phone while Antigravity stays on the desktop.
 
 ## Updating
-
-Once this repo is on GitHub, updates can be pulled with:
 
 ```bash
 git pull
@@ -77,22 +112,18 @@ npm install
 npm run mobile
 ```
 
-## Safety Notes
+## Safety notes
 
-- The URL token acts as an access key.
+- The tokenized URL is an access key.
 - Do not share the tokenized URL publicly.
-- Quick Tunnel URLs can change after restart.
+- Quick Tunnel URLs are temporary and can change after restart.
 
-## Development
-
-Checks used in this repo:
+## Development checks
 
 ```bash
 npm run lint
 npm run build
 ```
-
-GitHub Actions runs both on push and pull request.
 
 ## License
 
